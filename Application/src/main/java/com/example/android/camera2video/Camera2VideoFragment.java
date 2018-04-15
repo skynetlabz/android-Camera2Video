@@ -26,6 +26,7 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
@@ -37,6 +38,7 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.icu.text.AlphabeticIndex;
 import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -46,13 +48,20 @@ import android.support.v13.app.FragmentCompat;
 import android.support.v4.app.ActivityCompat;
 import android.util.Log;
 import android.util.Size;
+import android.util.Range;
 import android.util.SparseIntArray;
+import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.ImageButton;
+import android.widget.LinearLayout;
+import android.widget.TextClock;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
@@ -65,7 +74,9 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 public class Camera2VideoFragment extends Fragment
-        implements View.OnClickListener, FragmentCompat.OnRequestPermissionsResultCallback {
+        implements View.OnClickListener,
+                   View.OnKeyListener,
+                   FragmentCompat.OnRequestPermissionsResultCallback {
 
     private static final int SENSOR_ORIENTATION_DEFAULT_DEGREES = 90;
     private static final int SENSOR_ORIENTATION_INVERSE_DEGREES = 270;
@@ -75,6 +86,12 @@ public class Camera2VideoFragment extends Fragment
     private static final String TAG = "Camera2VideoFragment";
     private static final int REQUEST_VIDEO_PERMISSIONS = 1;
     private static final String FRAGMENT_DIALOG = "dialog";
+
+    private static final int BASE_FRAME_RATE = 30;
+    private static final int SLOMO_FRAME_RATE = 120;
+
+    private static final int VIDEO_RECORD_LENGTH = 6000; //ms
+    private static final int COUNTDOWN_LENGTH = 3; //sec
 
     private static final String[] VIDEO_PERMISSIONS = {
             Manifest.permission.CAMERA,
@@ -103,7 +120,7 @@ public class Camera2VideoFragment extends Fragment
     /**
      * Button to record video
      */
-    private Button mButtonVideo;
+    private ImageButton mButtonVideo;
 
     /**
      * A reference to the opened {@link android.hardware.camera2.CameraDevice}.
@@ -164,7 +181,8 @@ public class Camera2VideoFragment extends Fragment
     /**
      * Whether the app is recording video now
      */
-    private boolean mIsRecordingVideo;
+    private enum RecordState {Idle, Recording, Counting}
+    private RecordState mRecordState = RecordState.Idle;
 
     /**
      * An additional thread for running tasks that shouldn't block the UI.
@@ -218,6 +236,41 @@ public class Camera2VideoFragment extends Fragment
     private Integer mSensorOrientation;
     private String mNextVideoAbsolutePath;
     private CaptureRequest.Builder mPreviewBuilder;
+
+    /**
+     * A {@link Handler} for running automatically stopping recording.
+     */
+    private Handler mAutoStopHandler = new Handler();
+
+    /**
+     * Count of seconds left until recording beings.
+     */
+    private Integer mTimerCount = 1;
+    /**
+     * A {@link Handler} for running automatically starting recording.
+     */
+    private Handler mTimerHandler = new Handler();
+    /**
+     * A {@Link TextView} for displaying the countdown timer.
+     */
+    private TextView mCountdown;
+
+    /**
+     * A {@Link Runnable} that executes a tick of the countdown timer.
+     */
+    private Runnable mCameraTimer = new Runnable() {
+        public void run()
+        {
+            mTimerCount = mTimerCount - 1;
+            if (mTimerCount == 0) { startRecordingVideo(); }
+            else {
+                //set button number
+                mCountdown.setText(mTimerCount.toString());
+                //requeue timer tick
+                mTimerHandler.postDelayed(mCameraTimer, 1000);
+            }
+        }
+    };
 
     public static Camera2VideoFragment newInstance() {
         return new Camera2VideoFragment();
@@ -275,15 +328,21 @@ public class Camera2VideoFragment extends Fragment
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container,
                              Bundle savedInstanceState) {
-        return inflater.inflate(R.layout.fragment_camera2_video, container, false);
+        View mainView = inflater.inflate(R.layout.fragment_camera2_video, container, false);
+        mCountdown = (TextView) mainView.findViewById(R.id.overlay);
+        mCountdown.setText(R.string.count_default);
+        return mainView;
     }
 
     @Override
     public void onViewCreated(final View view, Bundle savedInstanceState) {
         mTextureView = (AutoFitTextureView) view.findViewById(R.id.texture);
-        mButtonVideo = (Button) view.findViewById(R.id.video);
+        mTextureView.setOnKeyListener(this);
+        //make sure we have focus to receive key events
+        mTextureView.setFocusableInTouchMode(true);
+        mTextureView.requestFocus();
+        mButtonVideo = (ImageButton) view.findViewById(R.id.video);
         mButtonVideo.setOnClickListener(this);
-        view.findViewById(R.id.info).setOnClickListener(this);
     }
 
     @Override
@@ -308,23 +367,39 @@ public class Camera2VideoFragment extends Fragment
     public void onClick(View view) {
         switch (view.getId()) {
             case R.id.video: {
-                if (mIsRecordingVideo) {
-                    stopRecordingVideo();
-                } else {
-                    startRecordingVideo();
+                switch(mRecordState) {
+                    case Recording: {
+                        stopRecordingVideo();
+                        break;
+                    }
+                    case Idle: {
+                        startCounting();
+                        break;
+                    }
+                    case Counting: {
+                        abortCounting();
+                        break;
+                    }
                 }
                 break;
             }
-            case R.id.info: {
-                Activity activity = getActivity();
-                if (null != activity) {
-                    new AlertDialog.Builder(activity)
-                            .setMessage(R.string.intro_message)
-                            .setPositiveButton(android.R.string.ok, null)
-                            .show();
+        }
+    }
+
+    @Override
+    public boolean onKey(View view, int keycode, KeyEvent keyEvent) {
+        switch (keycode) {
+            case KeyEvent.KEYCODE_ENTER :
+                //key up only triggers once per press
+                if (keyEvent.getAction() == KeyEvent.ACTION_UP) {
+                    Log.d(TAG, "ENTER Keycode Received");
+                    mButtonVideo.performClick();
                 }
-                break;
-            }
+                return true;
+            //ignore vol up key that is also sent
+            case KeyEvent.KEYCODE_VOLUME_UP : return true;
+            //pass on all other key codes
+            default : return false;
         }
     }
 
@@ -432,6 +507,11 @@ public class Camera2VideoFragment extends Fragment
 
             // Choose the sizes for camera preview and video recording
             CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+            Range<Integer>[] fpsRange = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+            for (Range<Integer> fps : fpsRange) {
+                Log.d(TAG, "FPS: min " + fps.getLower() + ", max " + fps.getUpper());
+            }
+
             StreamConfigurationMap map = characteristics
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             mSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
@@ -585,9 +665,12 @@ public class Camera2VideoFragment extends Fragment
         if (mNextVideoAbsolutePath == null || mNextVideoAbsolutePath.isEmpty()) {
             mNextVideoAbsolutePath = getVideoFilePath(getActivity());
         }
+
         mMediaRecorder.setOutputFile(mNextVideoAbsolutePath);
         mMediaRecorder.setVideoEncodingBitRate(10000000);
-        mMediaRecorder.setVideoFrameRate(30);
+        mMediaRecorder.setVideoFrameRate(BASE_FRAME_RATE);
+        mMediaRecorder.setCaptureRate(SLOMO_FRAME_RATE);
+        Log.d(TAG, "Capture rate set to 120 fps");
         mMediaRecorder.setVideoSize(mVideoSize.getWidth(), mVideoSize.getHeight());
         mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
         mMediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
@@ -600,7 +683,14 @@ public class Camera2VideoFragment extends Fragment
                 mMediaRecorder.setOrientationHint(INVERSE_ORIENTATIONS.get(rotation));
                 break;
         }
-        mMediaRecorder.prepare();
+        //exception will be thrown here if capture rate is not allowed
+        try {
+            mMediaRecorder.prepare();
+        } catch (Exception e) {
+            mMediaRecorder.setCaptureRate(BASE_FRAME_RATE);
+            Log.d(TAG, "Failed to up capture rate");
+            mMediaRecorder.prepare();
+        }
     }
 
     private String getVideoFilePath(Context context) {
@@ -609,11 +699,27 @@ public class Camera2VideoFragment extends Fragment
                 + System.currentTimeMillis() + ".mp4";
     }
 
+    private void startCounting() {
+        mRecordState = RecordState.Counting;
+        mButtonVideo.setImageResource(R.drawable.ic_videocam_off_white_48dp);
+        mTimerCount = COUNTDOWN_LENGTH;
+        mCountdown.setText(mTimerCount.toString());
+        mTimerHandler.postDelayed(mCameraTimer, 1000);
+    }
+
+    private void abortCounting() {
+        mTimerHandler.removeCallbacks(mCameraTimer);
+        mCountdown.setText(R.string.count_default);
+        mRecordState = RecordState.Idle;
+        mButtonVideo.setImageResource(R.drawable.ic_videocam_white_48dp);
+    }
+
     private void startRecordingVideo() {
         if (null == mCameraDevice || !mTextureView.isAvailable() || null == mPreviewSize) {
             return;
         }
         try {
+            mCountdown.setText("");
             closePreviewSession();
             setUpMediaRecorder();
             SurfaceTexture texture = mTextureView.getSurfaceTexture();
@@ -644,11 +750,18 @@ public class Camera2VideoFragment extends Fragment
                         @Override
                         public void run() {
                             // UI
-                            mButtonVideo.setText(R.string.stop);
-                            mIsRecordingVideo = true;
+                            mButtonVideo.setImageResource(R.drawable.ic_stop_white_48dp);
+                            mRecordState = RecordState.Recording;
 
                             // Start recording
                             mMediaRecorder.start();
+                            // Auto stop timer
+                            mAutoStopHandler.postDelayed(
+                                    new Runnable() {
+                                        public void run() {
+                                            if (mRecordState == RecordState.Recording)
+                                            { stopRecordingVideo();} } },
+                                    VIDEO_RECORD_LENGTH);
                         }
                     });
                 }
@@ -676,8 +789,10 @@ public class Camera2VideoFragment extends Fragment
 
     private void stopRecordingVideo() {
         // UI
-        mIsRecordingVideo = false;
-        mButtonVideo.setText(R.string.record);
+        mRecordState = RecordState.Idle;
+        mButtonVideo.setImageResource(R.drawable.ic_videocam_white_48dp);
+        mCountdown.setText(R.string.count_default);
+        mTimerHandler.removeCallbacks(mCameraTimer);
 
         //Added by @skynetlabz to resolve exception issue when stop recording.
         try {
